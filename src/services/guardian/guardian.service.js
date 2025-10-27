@@ -1,0 +1,465 @@
+import User from '../../models/data/user.model.js'
+import Guardian from '../../models/data/guardian.model.js'
+import GuardianUser from '../../models/data/guardian_user.model.js'
+import * as registerService from '../auth/register.service.js'
+import MedicalRecord from '../../models/data/medicalRecord.model.js'
+import ExcelJS from 'exceljs'
+import argon2 from 'argon2'
+import { sendRandomPassword } from '../../services/auth/password.service.js'
+
+export const createGuardianWithStudents = async ({ guardian }) => {
+  if (!guardian) {
+    const error = new Error('Missing guardian data')
+    error.status = 400
+    throw error
+  }
+
+  // Loại bỏ students nếu truyền nhầm
+  const { students, ...guardianData } = guardian
+
+  // Check username/email/phone trùng
+  const existingUsername = await User.findOne({ where: { username: guardianData.username } })
+  if (existingUsername) {
+    throw Object.assign(new Error('Guardian username already taken'), { status: 400 })
+  }
+
+  const existingEmail = await User.findOne({ where: { email: guardianData.email } })
+  if (existingEmail) {
+    throw Object.assign(new Error('Guardian email already taken'), { status: 400 })
+  }
+
+  const existingPhone = await User.findOne({ where: { phoneNumber: guardianData.phoneNumber } })
+  if (existingPhone) {
+    throw Object.assign(new Error('Guardian phone number already taken'), { status: 400 })
+  }
+
+  // Tạo user với role guardian
+  const guardianUser = await registerService.registerUser({
+    fullname: guardianData.fullname,
+    username: guardianData.username,
+    email: guardianData.email,
+    phoneNumber: guardianData.phoneNumber,
+    roleId: 4,
+    dateOfBirth: guardianData.dateOfBirth,
+    gender: guardianData.gender
+  })
+
+  // Tạo guardian
+  const guardianRecord = await Guardian.create({
+    phoneNumber: guardianData.phoneNumber,
+    roleInFamily: guardianData.roleInFamily,
+    isCallFirst: guardianData.isCallFirst,
+    userId: guardianUser.id,
+    address: guardianData.address,
+    dateOfBirth: guardianData.dateOfBirth,
+    gender: guardianData.gender
+  })
+
+  // Gộp dữ liệu trả về
+  const responseData = {
+    id: guardianUser.id,
+    obId: guardianRecord.obId,
+    fullname: guardianUser.fullname,
+    username: guardianUser.username,
+    email: guardianUser.email,
+    phoneNumber: guardianUser.phoneNumber,
+    roleId: guardianUser.roleId,
+    roleInFamily: guardianRecord.roleInFamily,
+    isCallFirst: guardianRecord.isCallFirst,
+    address: guardianRecord.address,
+    dateOfBirth: guardianUser.dateOfBirth,
+    gender: guardianUser.gender
+  }
+
+  return {
+    message: 'Guardian registered successfully',
+    data: responseData
+  }
+}
+
+// Get one guardian by obId including guardian info and student list
+export const getGuardianById = async (obId) => {
+  const guardian = await Guardian.findOne({ where: { obId } })
+  if (!guardian) {
+    const error = new Error('Guardian not found')
+    error.status = 404
+    throw error
+  }
+
+  // Guardian user info
+  const guardianUser = await User.findByPk(guardian.userId, {
+    attributes: ['id', 'username', 'fullname', 'email', 'phoneNumber']
+  })
+
+  // Students
+  const links = await GuardianUser.findAll({ where: { obId } })
+  const studentIds = links.map((l) => l.userId)
+  const students = studentIds.length
+    ? await User.findAll({
+        where: { id: studentIds },
+        attributes: ['id', 'username', 'fullname', 'email', 'phoneNumber']
+      })
+    : []
+
+  return {
+    ...guardian.dataValues,
+    fullname: guardianUser.fullname,
+    students
+  }
+}
+
+// Get all guardians with their user info and associated students
+export const getAllGuardians = async () => {
+  const guardians = await Guardian.findAll()
+  if (!guardians || !guardians.length) return []
+
+  const guardianData = await Promise.all(
+    guardians.map(async (guardian) => {
+      const user = await User.findByPk(guardian.userId, {
+        attributes: ['id', 'username', 'fullname', 'email', 'phoneNumber']
+      })
+
+      // Get associated students
+      const links = await GuardianUser.findAll({ where: { obId: guardian.obId } })
+      const studentIds = links.map((l) => l.userId)
+      const students = studentIds.length
+        ? await User.findAll({
+            where: { id: studentIds },
+            attributes: ['id', 'fullname', 'dateOfBirth', 'gender']
+          })
+        : []
+
+      return {
+        ...guardian.dataValues,
+        fullname: user.fullname,
+        students
+      }
+    })
+  )
+
+  return guardianData
+}
+
+// Update guardian record and its user info
+export const updateGuardian = async (obId, data) => {
+  const { fullname, username, email, phoneNumber, roleInFamily, isCallFirst, address } = data
+
+  const guardian = await Guardian.findOne({ where: { obId } })
+  if (!guardian) throw Object.assign(new Error('Guardian not found'), { status: 404 })
+
+  const user = await User.findByPk(guardian.userId)
+  if (!user) throw Object.assign(new Error('User not found'), { status: 404 })
+
+  // Update username/email uniqueness
+  if (username && username !== user.username) {
+    const ex = await User.findOne({ where: { username } })
+    if (ex) throw Object.assign(new Error('Username already taken'), { status: 400 })
+    user.username = username
+  }
+  if (email && email !== user.email) {
+    const ex = await User.findOne({ where: { email } })
+    if (ex) throw Object.assign(new Error('Email already taken'), { status: 400 })
+    user.email = email
+  }
+
+  // Update user fields
+  user.fullname = fullname || user.fullname
+  user.phoneNumber = phoneNumber || user.phoneNumber
+  await user.save()
+
+  // Update guardian-specific fields
+  guardian.roleInFamily = roleInFamily || guardian.roleInFamily
+  guardian.isCallFirst = isCallFirst !== undefined ? isCallFirst : guardian.isCallFirst
+  guardian.phoneNumber = phoneNumber || guardian.phoneNumber
+  if (address !== undefined) guardian.address = address
+  await guardian.save()
+
+  return {
+    message: 'Guardian updated successfully',
+    data: {
+      guardian: guardian.dataValues,
+      user: {
+        id: user.id,
+        username: user.username,
+        fullname: user.fullname,
+        email: user.email,
+        phoneNumber: user.phoneNumber
+      }
+    }
+  }
+}
+
+// Delete guardian, its links, and user record
+export const deleteGuardian = async (obId) => {
+  const guardian = await Guardian.findOne({ where: { obId }, paranoid: false })
+  if (!guardian || guardian.deletedAt) {
+    throw Object.assign(new Error('Guardian not found or already deleted'), { status: 404 })
+  }
+
+  // remove links (cứng luôn cũng được, vì liên kết trung gian)
+  await GuardianUser.destroy({ where: { obId } })
+
+  // soft delete guardian
+  await guardian.destroy()
+
+  // soft delete user
+  const user = await User.findByPk(guardian.userId, { paranoid: false })
+  if (user && !user.deletedAt) {
+    await user.destroy()
+  }
+
+  return { message: 'Guardian and associated students links soft deleted' }
+}
+
+// Get students associated with a guardian by userId
+
+export const getStudentsByUserId = async (userId) => {
+  // Tìm guardian theo userId
+  const guardian = await Guardian.findOne({ where: { userId } })
+  if (!guardian) {
+    const error = new Error('Guardian not found for this userId')
+    error.status = 404
+    throw error
+  }
+
+  // Lấy danh sách liên kết giữa guardian và học sinh
+  const links = await GuardianUser.findAll({ where: { obId: guardian.obId } })
+  const studentIds = links.map((link) => link.userId)
+
+  // Truy vấn các học sinh
+  const students = studentIds.length
+    ? await User.findAll({
+        where: { id: studentIds },
+        attributes: ['id', 'username', 'fullname', 'dateOfBirth']
+      })
+    : []
+
+  // Truy vấn thông tin Class từ bảng MedicalRecord
+  const medicalRecords = await MedicalRecord.findAll({
+    where: { userId: studentIds },
+    attributes: ['userId', 'Class']
+  })
+
+  // Map userId -> Class (dùng số nguyên, không ép string)
+  const recordMap = {}
+  for (const record of medicalRecords) {
+    recordMap[record.userId] = record.Class
+  }
+
+  // Gộp Class vào từng học sinh
+  const studentsWithClass = students.map((student) => {
+    const className = recordMap[student.id] || null
+    console.log('studentId:', student.id, '→ className:', className)
+
+    return {
+      id: student.id,
+      username: student.username,
+      fullname: student.fullname,
+      dateOfBirth: student.dateOfBirth,
+      className
+    }
+  })
+
+  return {
+    guardianObId: guardian.obId,
+    students: studentsWithClass
+  }
+}
+
+export const addStudentByGuardianId = async (obId, studentData) => {
+  const guardian = await Guardian.findOne({ where: { obId } })
+  if (!guardian) {
+    throw Object.assign(new Error('Guardian not found'), { status: 404 })
+  }
+
+  const existingUsername = await User.findOne({ where: { username: studentData.username } })
+  if (existingUsername) throw Object.assign(new Error('Student username already taken'), { status: 400 })
+  const existingEmail = await User.findOne({ where: { email: studentData.email } })
+  if (existingEmail) throw Object.assign(new Error('Student email already taken'), { status: 400 })
+
+  const studentUser = await registerService.registerUser({
+    fullname: studentData.fullname,
+    username: studentData.username,
+    email: studentData.email,
+    password: studentData.password,
+    phoneNumber: studentData.phoneNumber || null,
+    roleId: 3,
+    dateOfBirth: studentData.dateOfBirth,
+    gender: studentData.gender
+  })
+
+  await GuardianUser.create({
+    obId: guardian.obId,
+    userId: studentUser.id
+  })
+
+  return {
+    message: 'Student added successfully',
+    data: {
+      student: {
+        id: studentUser.id,
+        username: studentUser.username,
+        fullname: studentUser.fullname,
+        email: studentUser.email,
+        phoneNumber: studentUser.phoneNumber,
+        dateOfBirth: studentUser.dateOfBirth,
+        gender: studentUser.gender
+      }
+    }
+  }
+}
+
+export const updateStudentByGuardianId = async (obId, studentId, studentData) => {
+  const guardian = await Guardian.findOne({ where: { obId } })
+  if (!guardian) {
+    throw Object.assign(new Error('Guardian not found'), { status: 404 })
+  }
+
+  // Check if student belongs to guardian
+  const link = await GuardianUser.findOne({
+    where: { obId: guardian.obId, userId: studentId }
+  })
+  if (!link) {
+    throw Object.assign(new Error('Student not found for this guardian'), { status: 404 })
+  }
+
+  const student = await User.findByPk(studentId)
+  if (!student) {
+    throw Object.assign(new Error('Student not found'), { status: 404 })
+  }
+
+  // Check username/email uniqueness if changed
+  if (studentData.username && studentData.username !== student.username) {
+    const existing = await User.findOne({ where: { username: studentData.username } })
+    if (existing) throw Object.assign(new Error('Username already taken'), { status: 400 })
+  }
+  if (studentData.email && studentData.email !== student.email) {
+    const existing = await User.findOne({ where: { email: studentData.email } })
+    if (existing) throw Object.assign(new Error('Email already taken'), { status: 400 })
+  }
+
+  // Update student data
+  await student.update({
+    fullname: studentData.fullname || student.fullname,
+    username: studentData.username || student.username,
+    email: studentData.email || student.email,
+    phoneNumber: studentData.phoneNumber || student.phoneNumber,
+    dateOfBirth: studentData.dateOfBirth || student.dateOfBirth,
+    gender: studentData.gender || student.gender
+  })
+
+  return {
+    message: 'Student updated successfully',
+    data: {
+      student: {
+        id: student.id,
+        username: student.username,
+        fullname: student.fullname,
+        email: student.email,
+        phoneNumber: student.phoneNumber,
+        dateOfBirth: student.dateOfBirth,
+        gender: student.gender
+      }
+    }
+  }
+}
+
+export const deleteStudentByGuardianId = async (obId, studentId) => {
+  const guardian = await Guardian.findOne({ where: { obId }, paranoid: false })
+  if (!guardian || guardian.deletedAt) {
+    throw Object.assign(new Error('Guardian not found'), { status: 404 })
+  }
+
+  // Check if student belongs to guardian
+  const link = await GuardianUser.findOne({
+    where: { obId: guardian.obId, userId: studentId }
+  })
+
+  if (!link) {
+    throw Object.assign(new Error('Student not found for this guardian'), { status: 404 })
+  }
+
+  // Delete link
+  await GuardianUser.destroy({ where: { obId: guardian.obId, userId: studentId } })
+
+  // Soft delete student (User)
+  const student = await User.findByPk(studentId, { paranoid: false })
+  if (student && !student.deletedAt) {
+    await student.destroy()
+  }
+
+  return {
+    message: 'Student deleted successfully (soft)'
+  }
+}
+
+function generateRandomPassword(length = 6) {
+  const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_+-=[]{}'
+  let password = ''
+  for (let i = 0; i < length; i++) {
+    password += chars.charAt(Math.floor(Math.random() * chars.length))
+  }
+  return password
+}
+
+export async function importGuardiansExcelService(fileBuffer) {
+  const workbook = new ExcelJS.Workbook()
+  await workbook.xlsx.load(fileBuffer)
+
+  const sheet = workbook.worksheets[0]
+  const results = []
+
+  const headerRow = sheet.getRow(1)
+  const headers = headerRow.values.slice(1).map((h) => (h || '').toString().trim().toLowerCase())
+
+  for (let i = 2; i <= sheet.rowCount; i++) {
+    const row = sheet.getRow(i)
+    const rowData = {}
+
+    headers.forEach((key, index) => {
+      const cell = row.getCell(index + 1).value
+      rowData[key] = typeof cell === 'object' && cell?.text ? cell.text : cell
+    })
+
+    try {
+      const rawPassword = generateRandomPassword()
+      const hashedPassword = await argon2.hash(rawPassword)
+
+      const guardianData = {
+        fullname: rowData.fullname,
+        username: rowData.username,
+        email: rowData.email,
+        phoneNumber: rowData.phonenumber,
+        roleInFamily: rowData.roleinfamily,
+        isCallFirst: rowData.iscallfirst === true || rowData.iscallfirst === 'TRUE',
+        dateOfBirth:
+          rowData.dateofbirth instanceof Date ? rowData.dateofbirth.toISOString().split('T')[0] : rowData.dateofbirth,
+        gender: rowData.gender,
+        address: rowData.address,
+        password: hashedPassword
+      }
+
+      if (!guardianData.phoneNumber || !guardianData.roleInFamily) {
+        throw new Error('Thiếu số điện thoại hoặc vai trò trong gia đình')
+      }
+
+      await createGuardianWithStudents({ guardian: guardianData })
+      await User.update(
+        { address: guardianData.address },
+        { where: { email: guardianData.email } } // hoặc theo username nếu cần
+      )
+
+      try {
+        await sendRandomPassword(guardianData.email)
+      } catch (mailErr) {
+        console.error(`Gửi mail thất bại cho ${guardianData.email}:`, mailErr.message)
+      }
+
+      results.push({ username: guardianData.username, status: 'success' })
+    } catch (err) {
+      results.push({ username: rowData.username, status: 'failed', error: err.message })
+    }
+  }
+
+  return results
+}
